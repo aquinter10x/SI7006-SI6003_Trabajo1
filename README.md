@@ -5,6 +5,8 @@
 > Alejandro Quintero Moreno  
 > Santiago Gomez Rueda
 
+## Video: https://www.youtube.com/watch?v=cHrAHfBL724
+
 # 1. Parte A: Capas Medallion
 
 ## 1.1. Descripción
@@ -252,3 +254,334 @@ En Gold se construyó una agregación por aerolínea y aeropuerto de origen que 
 La comparación de rendimiento mostró que los datos escaneados disminuyeron de 4,54 GB en Bronze a 37,53 MB en Silver y 32,94 KB en Gold. El tiempo de ejecución pasó de 12,939 segundos a 3,714 y 2,723 segundos, respectivamente.
 
 Estos resultados respaldan el uso de una arquitectura Medallion para separar el almacenamiento original, la validación de calidad y la preparación de datos analíticos. En particular, la agregación precalculada de Gold permite responder consultas de negocio con un volumen de lectura considerablemente menor.
+
+# 2. Parte B: Streaming
+
+## 1. Resumen
+
+Se implementó un flujo de ingesta de eventos de sensores con la siguiente arquitectura:
+
+```
+Publicador (boto3, API Publish)
+        │  MQTT, tema sensores/<device_id>/datos
+        ▼
+   AWS IoT Core ── regla regla_sensores_a_sqs
+        │
+        ▼
+   SQS eventos-queue ──(3 recepciones fallidas)──► SQS eventos-dlq
+        │
+        ▼
+   Lambda procesar-eventos (valida el esquema)
+        │                         │
+        ▼                         ▼
+ DynamoDB eventos      DynamoDB eventos_descartados
+   (válidos)             (rechazados, con motivo)
+```
+
+**Resultado de la prueba:** se publicaron 10.000 eventos, se guardaron 9.332 y se descartaron 668, con el motivo registrado para cada uno. Los conteos cuadran exactamente. El retraso entre el envío y la llegada a DynamoDB fue de 1.555 ms en promedio y 20.174 ms como máximo.
+
+## 2. Esquema de los eventos
+
+Los datos son sintéticos y simulan 20 dispositivos virtuales (`dev-00` a `dev-19`) que reportan temperatura y humedad.
+
+```json
+{"device_id":"dev-07","seq":153,"sent_ts":1761200000123,"temperature":23.4,"humidity":55.1,"run_id":"r1"}
+```
+
+| Campo | Tipo | Regla de validación | Uso |
+|---|---|---|---|
+| `device_id` | string | obligatorio, no vacío | Partition key |
+| `seq` | entero | obligatorio | Sort key (contador por dispositivo) |
+| `sent_ts` | entero (ms epoch) | obligatorio | Cálculo del retraso |
+| `temperature` | número | obligatorio, entre -40 y 85 | Medición |
+| `humidity` | número | obligatorio, entre 0 y 100 | Medición |
+| `run_id` | string | opcional | Identifica la corrida |
+
+## 3. Recursos creados
+
+Todos los recursos se crearon manualmente desde la consola de AWS. La consola de CloudFormation no tiene stacks.
+
+| Recurso | Nombre | Configuración principal |
+|---|---|---|
+| Regla de IoT Core | `regla_sensores_a_sqs` | SQL: `SELECT *, timestamp() AS iot_ts FROM 'sensores/+/datos'`. Acción: Simple Queue Service sobre `eventos-queue`, sin codificación Base64. Rol: `iot-sqs-role` |
+| Cola SQS principal | `eventos-queue` | Standard, visibility timeout de 180 s, DLQ asociada con máximo 3 recepciones |
+| Cola SQS de errores | `eventos-dlq` | Standard |
+| Función Lambda | `procesar-eventos` | Python 3.12, 256 MB, timeout de 30 s, handler `lambda_function.handler` |
+| Trigger de Lambda | SQS `eventos-queue` | Batch size 10, batch window 5 s, *Report batch item failures* activado |
+| Tabla DynamoDB | `eventos` | Partition key `device_id` (S), sort key `seq` (N), modo on-demand |
+| Tabla DynamoDB | `eventos_descartados` | Partition key `message_id` (S), modo on-demand |
+
+El rol de ejecución de la Lambda tiene la política administrada `AWSLambdaSQSQueueExecutionRole` y una política en línea con `dynamodb:PutItem` sobre las dos tablas.
+
+### Decisiones de configuración
+
+- **Visibility timeout de 180 s:** equivale a seis veces el timeout de la función (30 s), valor recomendado por AWS para evitar que un mensaje en proceso vuelva a ser visible.
+- **DLQ con 3 recepciones:** los errores transitorios se reintentan y los mensajes que fallan de forma persistente no bloquean el flujo.
+- **Modo on-demand:** evita dimensionar capacidad y absorbe el pico de la prueba.
+- **Campo `iot_ts` en la regla:** registra el instante en que IoT Core procesó el mensaje, lo que permite separar tramos del retraso en análisis posteriores.
+- **Report batch item failures:** solo se reintentan los mensajes que fallaron dentro de un lote, no el lote completo.
+
+## 4. Llave de DynamoDB y justificación
+
+La tabla `eventos` usa `device_id` como partition key y `seq` como sort key.
+
+- **Distribución de la carga:** al usar `device_id` como partición, las escrituras se reparten entre 20 dispositivos.
+- **Consulta natural:** permite obtener todos los eventos de un dispositivo, ordenados, con un `Query` eficiente en lugar de un `Scan`.
+- **Unicidad:** la combinación `device_id` + `seq` identifica cada evento de forma única.
+- **Idempotencia:** SQS Standard entrega los mensajes al menos una vez, por lo que pueden llegar duplicados. El `PutItem` usa la condición `attribute_not_exists(device_id)`; si la llave ya existe, el evento se registra como descartado con el motivo `duplicado`.
+- **Por qué no se usó el timestamp como llave:** dos eventos pueden coincidir en el mismo milisegundo y el reloj del dispositivo no es confiable.
+
+En `eventos_descartados` la llave es el `MessageId` de SQS, que es único y se conserva entre reintentos, de modo que un reintento sobrescribe el mismo registro y no genera filas duplicadas.
+
+## 5. Función Lambda
+
+La función procesa lotes de hasta 10 mensajes. Para cada uno realiza lo siguiente:
+
+1. Intenta interpretar el cuerpo como JSON. Si no es un objeto JSON válido, lo descarta con el motivo `json_invalido`.
+2. Valida presencia, tipo y rango de los campos. Si falla, lo descarta con el motivo correspondiente (`campo_faltante:<campo>`, `tipo_invalido:<campo>` o `fuera_de_rango:<campo>`).
+3. Si es válido, agrega `stored_ts` (instante de escritura) y lo guarda en `eventos` con la condición de unicidad.
+4. Si la llave ya existe, lo registra como `duplicado`.
+5. Ante cualquier otro error (por ejemplo, throttling), devuelve el mensaje en `batchItemFailures` para que SQS lo reintente. Tras tres recepciones fallidas pasa a la DLQ.
+
+Variables de entorno: `TABLE=eventos` y `DISCARD_TABLE=eventos_descartados`.
+
+```python
+import json, os, time
+from decimal import Decimal
+import boto3
+from botocore.exceptions import ClientError
+
+ddb = boto3.resource("dynamodb")
+tabla = ddb.Table(os.environ["TABLE"])
+descartes = ddb.Table(os.environ["DISCARD_TABLE"])
+
+def es_int(x):  return isinstance(x, int) and not isinstance(x, bool)
+def es_num(x):  return isinstance(x, (int, Decimal)) and not isinstance(x, bool) or isinstance(x, Decimal)
+
+def validar(e):
+    """Devuelve None si es válido, o el motivo del descarte."""
+    for c in ("device_id", "seq", "sent_ts", "temperature", "humidity"):
+        if c not in e:
+            return f"campo_faltante:{c}"
+    if not isinstance(e["device_id"], str) or not e["device_id"]:
+        return "tipo_invalido:device_id"
+    if not es_int(e["seq"]):         return "tipo_invalido:seq"
+    if not es_int(e["sent_ts"]):     return "tipo_invalido:sent_ts"
+    if not es_num(e["temperature"]): return "tipo_invalido:temperature"
+    if not es_num(e["humidity"]):    return "tipo_invalido:humidity"
+    if not -40 <= e["temperature"] <= 85: return "fuera_de_rango:temperature"
+    if not 0 <= e["humidity"] <= 100:     return "fuera_de_rango:humidity"
+    return None
+
+def descartar(msg_id, motivo, cuerpo):
+    descartes.put_item(Item={
+        "message_id": msg_id, "motivo": motivo,
+        "payload": cuerpo[:2000], "descartado_ts": int(time.time() * 1000)})
+
+def handler(event, context):
+    fallos = []
+    for r in event["Records"]:
+        mid, cuerpo = r["messageId"], r["body"]
+        try:
+            try:
+                e = json.loads(cuerpo, parse_float=Decimal)
+                if not isinstance(e, dict):
+                    raise ValueError
+            except ValueError:
+                descartar(mid, "json_invalido", cuerpo); continue
+
+            motivo = validar(e)
+            if motivo:
+                descartar(mid, motivo, cuerpo); continue
+
+            e["stored_ts"] = int(time.time() * 1000)   # llegada a DynamoDB
+            try:
+                tabla.put_item(Item=e,
+                    ConditionExpression="attribute_not_exists(device_id)")
+            except ClientError as ce:
+                if ce.response["Error"]["Code"] == "ConditionalCheckFailedException":
+                    descartar(mid, "duplicado", cuerpo)
+                else:
+                    raise
+        except Exception as ex:
+            print("error", mid, ex)
+            fallos.append({"itemIdentifier": mid})   # SQS lo reintenta; tras 3 va a la DLQ
+    return {"batchItemFailures": fallos}
+```
+
+## 6. Generación y publicación de eventos
+
+El script `publicar.py` genera los eventos y los publica con la API `Publish` de IoT Core (cliente `iot-data` de boto3, QoS 1) usando 30 hilos, ejecutado desde AWS CloudShell. El campo `sent_ts` se fija en el momento exacto del envío.
+
+La carga se compone de:
+
+- **9.900 eventos únicos**, repartidos entre 20 dispositivos.
+- **Errores inyectados a propósito** (aproximadamente 2 % cada uno): campo `humidity` ausente, `temperature` con valor de texto y `humidity` fuera de rango (250).
+- **100 eventos duplicados**, copias exactas (mismo `device_id` y `seq`) de eventos ya generados, mezcladas al azar.
+
+Total: 10.000 publicaciones. El script registra en `publicados.txt` el número de publicaciones aceptadas por la API, que se usa como base del cuadre.
+
+```python
+# publicar.py
+import boto3, json, random, time, threading
+from botocore.config import Config
+from concurrent.futures import ThreadPoolExecutor
+
+ENDPOINT = "https://XXXXXXXX-ats.iot.us-east-2.amazonaws.com"   # endpoint iot:Data-ATS
+REGION = "us-east-2"
+UNICOS, DUPLICADOS, DEVICES, WORKERS = 9900, 100, 20, 30
+RUN = "r1"
+
+iot = boto3.client("iot-data", endpoint_url=ENDPOINT, region_name=REGION,
+                   config=Config(max_pool_connections=WORKERS + 5))
+ok = 0
+fallos = 0
+lock = threading.Lock()
+contador = {f"dev-{i:02d}": 0 for i in range(DEVICES)}
+
+def generar(n):
+    dev = f"dev-{n % DEVICES:02d}"
+    contador[dev] += 1
+    e = {"device_id": dev, "seq": contador[dev], "sent_ts": 0,
+         "temperature": round(random.uniform(15, 35), 1),
+         "humidity": round(random.uniform(30, 80), 1), "run_id": RUN}
+    r = random.random()
+    if   r < 0.02: del e["humidity"]                 # -> campo_faltante
+    elif r < 0.04: e["temperature"] = "caliente"     # -> tipo_invalido
+    elif r < 0.06: e["humidity"] = 250               # -> fuera_de_rango
+    return e
+
+def enviar(e):
+    global ok, fallos
+    e = dict(e)
+    e["sent_ts"] = int(time.time() * 1000)           # se fija justo al enviar
+    try:
+        iot.publish(topic=f"sensores/{e['device_id']}/datos", qos=1,
+                    payload=json.dumps(e))
+        with lock: ok += 1
+    except Exception as ex:
+        with lock: fallos += 1
+        print("fallo API:", ex)
+
+eventos = [generar(n) for n in range(UNICOS)]
+eventos += random.sample(eventos, DUPLICADOS)        # mismos device_id y seq
+random.shuffle(eventos)
+
+t0 = time.time()
+with ThreadPoolExecutor(max_workers=WORKERS) as pool:
+    list(pool.map(enviar, eventos))
+dur = time.time() - t0
+
+with open("publicados.txt", "w") as f:
+    f.write(str(ok))
+print(f"Publicados OK: {ok} | fallos API: {fallos} | duración: {dur:.0f}s")
+```
+
+**Salida de la ejecución:**
+
+```
+Publicados OK: 10000 | fallos API: 0 | duración: 19s
+```
+
+Se publicaron los 10.000 eventos sin fallos de la API, a una tasa aproximada de 525 mensajes por segundo.
+
+## 7. Verificación y cuadre de conteos
+
+El script `reconciliar.py` recorre con `Scan` las dos tablas, cuenta los registros, agrupa los descartados por motivo y calcula el retraso como `stored_ts - sent_ts` para cada evento guardado.
+
+```python
+# reconciliar.py
+import boto3
+from collections import Counter
+from statistics import mean
+ddb = boto3.resource("dynamodb")
+
+def scan_all(nombre):
+    t, items, kw = ddb.Table(nombre), [], {}
+    while True:
+        r = t.scan(**kw); items += r["Items"]
+        if "LastEvaluatedKey" not in r: return items
+        kw["ExclusiveStartKey"] = r["LastEvaluatedKey"]
+
+ev  = scan_all("eventos")
+des = scan_all("eventos_descartados")
+PUBLICADOS = 10000          # valor impreso por publicar.py
+
+motivos = Counter(d["motivo"] for d in des)
+print("Guardados:", len(ev))
+print("Descartados:", len(des), dict(motivos))
+print("Guardados + descartados =", len(ev) + len(des), "| Publicados =", PUBLICADOS)
+
+delays = [int(e["stored_ts"]) - int(e["sent_ts"]) for e in ev]
+print(f"Retraso envío→DynamoDB: promedio {mean(delays):.0f} ms | "
+      f"máximo {max(delays)} ms | mínimo {min(delays)} ms")
+```
+
+**Salida de la ejecución:**
+
+```
+Guardados: 9332
+Descartados: 668 {'tipo_invalido:temperature': 191, 'duplicado': 94, 'fuera_de_rango:humidity': 189, 'campo_faltante:humidity': 194}
+Guardados + descartados = 10000 | Publicados = 10000
+Retraso envío→DynamoDB: promedio 1555 ms | máximo 20174 ms | mínimo 39 ms
+```
+
+### Cuadre de eventos
+
+| Concepto | Cantidad |
+|---|---|
+| **Publicados (API OK)** | **10.000** |
+| Guardados en DynamoDB (`eventos`) | 9.332 |
+| Descartados: `campo_faltante:humidity` | 194 |
+| Descartados: `tipo_invalido:temperature` | 191 |
+| Descartados: `fuera_de_rango:humidity` | 189 |
+| Descartados: `duplicado` | 94 |
+| **Total descartados** | **668** |
+| **Guardados + descartados** | **10.000** |
+
+La igualdad **publicados = guardados + descartados** se cumple, y los motivos suman exactamente los 668 descartados.
+
+### Motivos de descarte
+
+| Motivo | Origen | Cantidad |
+|---|---|---|
+| `campo_faltante:humidity` | Eventos publicados sin el campo `humidity` | 194 |
+| `tipo_invalido:temperature` | Eventos con `temperature` de tipo texto | 191 |
+| `fuera_de_rango:humidity` | Eventos con `humidity` igual a 250 | 189 |
+| `duplicado` | Reentrega de un par `device_id` + `seq` ya guardado | 94 |
+
+Los tres primeros motivos corresponden a los errores inyectados por el generador (cerca del 2 % cada uno sobre 9.900 eventos únicos). Se registraron 94 duplicados y no 100 porque seis de las copias provenían de eventos que ya eran inválidos: ambas copias se descartan por su motivo original y no por la condición de unicidad.
+
+## 8. Retraso entre envío y llegada
+
+El retraso se mide como la diferencia entre `stored_ts` (asignado por la Lambda al escribir) y `sent_ts` (asignado por el publicador al enviar). Ambos procesos se ejecutaron en AWS (CloudShell y Lambda), lo que reduce el sesgo por diferencia de relojes.
+
+| Métrica | Valor |
+|---|---|
+| Promedio | 1.555 ms |
+| Máximo | 20.174 ms |
+| Mínimo | 39 ms |
+
+**Interpretación:**
+
+- El promedio queda por debajo de la ventana de 5 s del trigger. Con el volumen de la prueba los lotes se completan con 10 mensajes, por lo que la función se invoca sin esperar a que termine la ventana.
+- El máximo es cercano a la duración total de la publicación (19 s). La explicación más probable es que el ritmo de publicación (unos 525 mensajes por segundo) superó al principio la capacidad de consumo, de modo que se acumuló una cola y los últimos mensajes esperaron más. Esta hipótesis no se verificó con métricas de CloudWatch (por ejemplo, *Approximate Age Of Oldest Message* en SQS o *Concurrent executions* en Lambda).
+
+## 9. Estado final de las colas
+
+Al terminar el procesamiento, `eventos-queue` y `eventos-dlq` no tenían mensajes disponibles ni en vuelo, lo que confirma que no quedaron eventos pendientes ni mensajes en la cola de errores. La consola de SQS respalda este dato.
+
+## 10. Preguntas finales
+
+### ¿A partir de qué volumen se dejaría esta forma de streaming?
+
+La arquitectura funciona bien hasta unos cientos de eventos por segundo sostenidos: SQS Standard escala casi sin límite, Lambda escala por concurrencia y DynamoDB on-demand absorbe la carga. Los umbrales siguientes son orientativos y dependen del caso:
+
+1. **Alrededor de 1.000 eventos por segundo sostenidos, o decenas de millones de mensajes al mes.** El consumo en lotes de 10 depende mucho de la concurrencia disponible (una cuenta nueva puede tener un límite bajo) y el costo por evento de SQS, Lambda y escritura individual en DynamoDB se vuelve relevante.
+2. **Necesidad de releer o reprocesar el historial.** SQS elimina el mensaje al consumirlo y no ofrece *replay*.
+3. **Necesidad de orden estricto por dispositivo o de varios consumidores independientes** sobre el mismo flujo (analítica, alertas y almacenamiento). SQS Standard no garantiza orden ni permite que varios consumidores lean el mismo mensaje.
+4. **Necesidad de agregaciones por ventanas de tiempo**, como promedios por minuto o detección de anomalías.
+
+### ¿Qué se usaría en su lugar?
+
+**Amazon Kinesis Data Streams.** Ofrece orden por partition key, retención con *replay* (de 24 horas a 365 días), múltiples consumidores y escalado por shards. La regla de IoT Core puede enviar los mensajes directamente a Kinesis. Para el histórico se añadiría **Kinesis Data Firehose hacia S3** (formato Parquet consultable con Athena), y DynamoDB quedaría para consultas de último estado. Si el volumen llegara a cientos de miles de eventos por segundo, o ya existiera un ecosistema Kafka, se evaluaría **Amazon MSK**.
