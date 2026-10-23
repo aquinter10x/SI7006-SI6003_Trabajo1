@@ -345,70 +345,6 @@ La función procesa lotes de hasta 10 mensajes. Para cada uno realiza lo siguien
 
 Variables de entorno: `TABLE=eventos` y `DISCARD_TABLE=eventos_descartados`.
 
-```python
-import json, os, time
-from decimal import Decimal
-import boto3
-from botocore.exceptions import ClientError
-
-ddb = boto3.resource("dynamodb")
-tabla = ddb.Table(os.environ["TABLE"])
-descartes = ddb.Table(os.environ["DISCARD_TABLE"])
-
-def es_int(x):  return isinstance(x, int) and not isinstance(x, bool)
-def es_num(x):  return isinstance(x, (int, Decimal)) and not isinstance(x, bool) or isinstance(x, Decimal)
-
-def validar(e):
-    """Devuelve None si es válido, o el motivo del descarte."""
-    for c in ("device_id", "seq", "sent_ts", "temperature", "humidity"):
-        if c not in e:
-            return f"campo_faltante:{c}"
-    if not isinstance(e["device_id"], str) or not e["device_id"]:
-        return "tipo_invalido:device_id"
-    if not es_int(e["seq"]):         return "tipo_invalido:seq"
-    if not es_int(e["sent_ts"]):     return "tipo_invalido:sent_ts"
-    if not es_num(e["temperature"]): return "tipo_invalido:temperature"
-    if not es_num(e["humidity"]):    return "tipo_invalido:humidity"
-    if not -40 <= e["temperature"] <= 85: return "fuera_de_rango:temperature"
-    if not 0 <= e["humidity"] <= 100:     return "fuera_de_rango:humidity"
-    return None
-
-def descartar(msg_id, motivo, cuerpo):
-    descartes.put_item(Item={
-        "message_id": msg_id, "motivo": motivo,
-        "payload": cuerpo[:2000], "descartado_ts": int(time.time() * 1000)})
-
-def handler(event, context):
-    fallos = []
-    for r in event["Records"]:
-        mid, cuerpo = r["messageId"], r["body"]
-        try:
-            try:
-                e = json.loads(cuerpo, parse_float=Decimal)
-                if not isinstance(e, dict):
-                    raise ValueError
-            except ValueError:
-                descartar(mid, "json_invalido", cuerpo); continue
-
-            motivo = validar(e)
-            if motivo:
-                descartar(mid, motivo, cuerpo); continue
-
-            e["stored_ts"] = int(time.time() * 1000)   # llegada a DynamoDB
-            try:
-                tabla.put_item(Item=e,
-                    ConditionExpression="attribute_not_exists(device_id)")
-            except ClientError as ce:
-                if ce.response["Error"]["Code"] == "ConditionalCheckFailedException":
-                    descartar(mid, "duplicado", cuerpo)
-                else:
-                    raise
-        except Exception as ex:
-            print("error", mid, ex)
-            fallos.append({"itemIdentifier": mid})   # SQS lo reintenta; tras 3 va a la DLQ
-    return {"batchItemFailures": fallos}
-```
-
 ## 6. Generación y publicación de eventos
 
 El script `publicar.py` genera los eventos y los publica con la API `Publish` de IoT Core (cliente `iot-data` de boto3, QoS 1) usando 30 hilos, ejecutado desde AWS CloudShell. El campo `sent_ts` se fija en el momento exacto del envío.
@@ -421,62 +357,6 @@ La carga se compone de:
 
 Total: 10.000 publicaciones. El script registra en `publicados.txt` el número de publicaciones aceptadas por la API, que se usa como base del cuadre.
 
-```python
-# publicar.py
-import boto3, json, random, time, threading
-from botocore.config import Config
-from concurrent.futures import ThreadPoolExecutor
-
-ENDPOINT = "https://XXXXXXXX-ats.iot.us-east-2.amazonaws.com"   # endpoint iot:Data-ATS
-REGION = "us-east-2"
-UNICOS, DUPLICADOS, DEVICES, WORKERS = 9900, 100, 20, 30
-RUN = "r1"
-
-iot = boto3.client("iot-data", endpoint_url=ENDPOINT, region_name=REGION,
-                   config=Config(max_pool_connections=WORKERS + 5))
-ok = 0
-fallos = 0
-lock = threading.Lock()
-contador = {f"dev-{i:02d}": 0 for i in range(DEVICES)}
-
-def generar(n):
-    dev = f"dev-{n % DEVICES:02d}"
-    contador[dev] += 1
-    e = {"device_id": dev, "seq": contador[dev], "sent_ts": 0,
-         "temperature": round(random.uniform(15, 35), 1),
-         "humidity": round(random.uniform(30, 80), 1), "run_id": RUN}
-    r = random.random()
-    if   r < 0.02: del e["humidity"]                 # -> campo_faltante
-    elif r < 0.04: e["temperature"] = "caliente"     # -> tipo_invalido
-    elif r < 0.06: e["humidity"] = 250               # -> fuera_de_rango
-    return e
-
-def enviar(e):
-    global ok, fallos
-    e = dict(e)
-    e["sent_ts"] = int(time.time() * 1000)           # se fija justo al enviar
-    try:
-        iot.publish(topic=f"sensores/{e['device_id']}/datos", qos=1,
-                    payload=json.dumps(e))
-        with lock: ok += 1
-    except Exception as ex:
-        with lock: fallos += 1
-        print("fallo API:", ex)
-
-eventos = [generar(n) for n in range(UNICOS)]
-eventos += random.sample(eventos, DUPLICADOS)        # mismos device_id y seq
-random.shuffle(eventos)
-
-t0 = time.time()
-with ThreadPoolExecutor(max_workers=WORKERS) as pool:
-    list(pool.map(enviar, eventos))
-dur = time.time() - t0
-
-with open("publicados.txt", "w") as f:
-    f.write(str(ok))
-print(f"Publicados OK: {ok} | fallos API: {fallos} | duración: {dur:.0f}s")
-```
-
 **Salida de la ejecución:**
 
 ```
@@ -488,34 +368,6 @@ Se publicaron los 10.000 eventos sin fallos de la API, a una tasa aproximada de 
 ## 7. Verificación y cuadre de conteos
 
 El script `reconciliar.py` recorre con `Scan` las dos tablas, cuenta los registros, agrupa los descartados por motivo y calcula el retraso como `stored_ts - sent_ts` para cada evento guardado.
-
-```python
-# reconciliar.py
-import boto3
-from collections import Counter
-from statistics import mean
-ddb = boto3.resource("dynamodb")
-
-def scan_all(nombre):
-    t, items, kw = ddb.Table(nombre), [], {}
-    while True:
-        r = t.scan(**kw); items += r["Items"]
-        if "LastEvaluatedKey" not in r: return items
-        kw["ExclusiveStartKey"] = r["LastEvaluatedKey"]
-
-ev  = scan_all("eventos")
-des = scan_all("eventos_descartados")
-PUBLICADOS = 10000          # valor impreso por publicar.py
-
-motivos = Counter(d["motivo"] for d in des)
-print("Guardados:", len(ev))
-print("Descartados:", len(des), dict(motivos))
-print("Guardados + descartados =", len(ev) + len(des), "| Publicados =", PUBLICADOS)
-
-delays = [int(e["stored_ts"]) - int(e["sent_ts"]) for e in ev]
-print(f"Retraso envío→DynamoDB: promedio {mean(delays):.0f} ms | "
-      f"máximo {max(delays)} ms | mínimo {min(delays)} ms")
-```
 
 **Salida de la ejecución:**
 
@@ -550,7 +402,7 @@ La igualdad **publicados = guardados + descartados** se cumple, y los motivos su
 | `fuera_de_rango:humidity` | Eventos con `humidity` igual a 250 | 189 |
 | `duplicado` | Reentrega de un par `device_id` + `seq` ya guardado | 94 |
 
-Los tres primeros motivos corresponden a los errores inyectados por el generador (cerca del 2 % cada uno sobre 9.900 eventos únicos). Se registraron 94 duplicados y no 100 porque seis de las copias provenían de eventos que ya eran inválidos: ambas copias se descartan por su motivo original y no por la condición de unicidad.
+Los tres primeros motivos corresponden a los errores inyectados por el generador. Se registraron 94 duplicados y no 100 porque seis de las copias provenían de eventos que ya eran inválidos: ambas copias se descartan por su motivo original y no por la condición de unicidad.
 
 ## 8. Retraso entre envío y llegada
 
